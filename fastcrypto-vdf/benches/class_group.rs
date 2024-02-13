@@ -41,13 +41,16 @@ fn class_group_ops(c: &mut Criterion) {
 }
 
 fn qf_from_seed_single<M: Measurement>(discriminant_string: &str, group: &mut BenchmarkGroup<M>) {
-    for k in [1, 2, 4, 8, 16, 32, 64] {
-        let discriminant =
-            Discriminant::try_from(BigInt::from_str_radix(discriminant_string, 10).unwrap())
-                .unwrap();
+    let discriminant =
+        Discriminant::try_from(BigInt::from_str_radix(discriminant_string, 10).unwrap()).unwrap();
+
+    for k in [1, 2, 4, 8, 16, 26, 32, 64] {
+        if k > fastcrypto_vdf::class_group::hash::largest_allowed_k(&discriminant) {
+            continue;
+        }
 
         let bits = discriminant.bits();
-        group.bench_function(format!("{} bits/{}", bits, k), move |b| {
+        group.bench_function(format!("{} bits/{}", bits, k), |b| {
             let mut seed = [0u8; 32];
             thread_rng().fill_bytes(&mut seed);
             b.iter(|| QuadraticForm::hash_to_group(&seed, &discriminant, k))

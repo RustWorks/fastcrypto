@@ -15,10 +15,19 @@ use num_bigint::{BigInt, UniformBigInt};
 use num_integer::Integer;
 use num_traits::Signed;
 use rand::distributions::uniform::UniformSampler;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::cmp::min;
 use std::ops::{AddAssign, ShlAssign, Shr};
+#[cfg(feature = "parallel")]
+use std::sync::{Arc, Mutex};
+#[cfg(feature = "parallel")]
+use itertools::{enumerate, Itertools};
+use rand::seq::index::sample;
+#[cfg(feature = "parallel")]
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+#[cfg(feature = "parallel")]
+use rayon::iter::IntoParallelRefIterator;
 
 impl QuadraticForm {
     /// Generate a random quadratic form from a seed with the given discriminant. This method is deterministic and it is
@@ -62,7 +71,7 @@ impl QuadraticForm {
 /// Increasing `k` reduces the range of the hash function for a given discriminant. This function returns a choice of
 /// `k` such that the range is at least `2^256`, and chooses this it as large as possible. Consult the paper for
 /// details.
-fn largest_allowed_k(discriminant: &Discriminant) -> u16 {
+pub fn largest_allowed_k(discriminant: &Discriminant) -> u16 {
     let bits = discriminant.bits();
     let lambda = 256.0;
     let log_b = bits as f64 / 2.0 - 1.0;
@@ -74,6 +83,7 @@ fn largest_allowed_k(discriminant: &Discriminant) -> u16 {
 /// Sample a product of `k` primes and return this along with the square root of the discriminant modulo `a`. If `k` is
 /// larger than the largest allowed `k` (as computed in [largest_allowed_k]) for the given discriminant, an
 /// [InvalidInput] error is returned.
+#[cfg(not(feature = "parallel"))]
 fn sample_modulus(
     discriminant: &Discriminant,
     seed: &[u8],
@@ -86,23 +96,18 @@ fn sample_modulus(
 
     // If a is smaller than this bound and |b| < a, the form is guaranteed to be reduced.
     let mut bound: BigInt = discriminant.as_bigint().abs().sqrt().shr(1);
+
     if k > 1 {
         bound = bound.nth_root(k as u32);
     }
 
     // Seed a rng with the hash of the seed
     let mut rng = ChaCha8Rng::from_seed(Sha256::digest(seed).digest);
-    let mut factors = Vec::with_capacity(k as usize);
-    let mut square_roots = Vec::with_capacity(k as usize);
 
-    for _ in 0..k {
+    let mut factors: Vec<BigInt> = (0..k).map(|_| {
         let mut factor;
         loop {
             factor = sample_odd_number(&bound, &mut rng);
-
-            if factors.contains(&factor) {
-                continue;
-            }
 
             // The primality check does not try divisions with small primes, so we do it here. This speeds up the
             // algorithm significantly.
@@ -119,12 +124,85 @@ fn sample_modulus(
                 break;
             }
         }
-        let square_root = modular_square_root(discriminant.as_bigint(), &factor, false)
-            .expect("Legendre symbol checked above");
-        factors.push(factor);
-        square_roots.push(square_root);
+        factor
+    }).collect();
+
+    factors.sort();
+    factors.dedup();
+
+    if factors.len() < k as usize {
+        return sample_modulus(discriminant, &Sha256::digest(seed).digest, k);
     }
 
+    let square_roots: Vec<BigInt> = factors.iter().map(|factor| modular_square_root(discriminant.as_bigint(), &factor, false)
+        .expect("Legendre symbol checked above")).collect();
+
+    let result = factors.iter().product();
+    let square_root = solve_congruence_equation_system(&square_roots, &factors)
+        .expect("The factors are distinct primes");
+
+    Ok((result, square_root))
+}
+
+
+/// Sample a product of `k` primes and return this along with the square root of the discriminant modulo `a`. If `k` is
+/// larger than the largest allowed `k` (as computed in [largest_allowed_k]) for the given discriminant, an
+/// [InvalidInput] error is returned.
+#[cfg(feature = "parallel")]
+fn sample_modulus(
+    discriminant: &Discriminant,
+    seed: &[u8],
+    k: u16,
+) -> FastCryptoResult<(BigInt, BigInt)> {
+    // This heuristic bound ensures that the range of the hash function has size at least 2^256.
+    if k > largest_allowed_k(discriminant) {
+        return Err(InvalidInput);
+    }
+
+    // If a is smaller than this bound and |b| < a, the form is guaranteed to be reduced.
+    let mut bound: BigInt = discriminant.as_bigint().abs().sqrt().shr(1);
+    let mut rngs = vec![ChaCha8Rng::from_seed(Sha256::digest(seed).digest)];
+    if k > 1 {
+        bound = bound.nth_root(k as u32);
+        for _ in 1..k {
+            let mut sub_seed = [0u8; 32];
+            rngs[0].fill_bytes(&mut sub_seed);
+            rngs.push(ChaCha8Rng::from_seed(sub_seed));
+        }
+    }
+
+    let mut factors_and_square_roots: Vec<(BigInt, BigInt)> = rngs.into_par_iter().map(|mut rng| {
+        let mut factor;
+        loop {
+            factor = sample_odd_number(&bound, &mut rng);
+
+            // The primality check does not try divisions with small primes, so we do it here. This speeds up the
+            // algorithm significantly.
+            if !trial_division(&factor, &PRIMES) {
+                continue;
+            }
+
+            if jacobi::jacobi(discriminant.as_bigint(), &factor)
+                .expect("factor is odd and positive")
+                == 1
+                && DefaultPrimalityCheck::is_probable_prime(factor.magnitude())
+            {
+                // Found a valid factor
+                break;
+            }
+        }
+        let square_root = modular_square_root(discriminant.as_bigint(), &factor, false).unwrap();
+        (factor, square_root)
+    }).collect();
+
+    factors_and_square_roots.sort_by(|x, y| x.0.cmp(&y.0));
+    factors_and_square_roots.dedup_by(|x, y| x.0 == y.0);
+
+    if factors_and_square_roots.len() < k as usize {
+        return sample_modulus(discriminant, &Sha256::digest(seed).digest, k);
+    }
+
+    let (factors, square_roots): (Vec<BigInt>, Vec<BigInt>) = factors_and_square_roots.into_iter().unzip();
     let result = factors.iter().product();
     let square_root = solve_congruence_equation_system(&square_roots, &factors)
         .expect("The factors are distinct primes");
